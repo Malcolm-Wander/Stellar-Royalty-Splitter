@@ -25,6 +25,8 @@ pub enum DataKey {
     LastDistribution,
     LastSecondaryDistribution,
     Paused,
+    DefaultRecipients,
+    DistributeHistory,
 }
 
 const MIN_TTL: u32 = 17_280;
@@ -268,21 +270,109 @@ impl RoyaltySplitter {
         token::Client::new(&env, &token).balance(&env.current_contract_address())
     }
 
-    /// Distribute the full contract balance of `token` to all collaborators.
+    /// Set the default recipient list for royalty distributions.
+    ///
+    /// This provides a fallback recipient list that can be used when no override
+    /// list is supplied to distribute(). Useful for standard royalty splits that
+    /// don't change frequently.
+    ///
+    /// # Arguments
+    /// * `recipients` - Ordered list of (address, share) pairs for default distribution.
+    ///   Maximum of 10 recipients allowed. Shares must sum to exactly 10,000 (100%).
+    ///
+    /// # Authorization
+    /// Requires admin signature.
+    ///
+    /// # Panics
+    /// * `"contract not initialized"` — called before `initialize`
+    /// * `"too many recipients: maximum 10 allowed"` — more than 10 recipients
+    /// * `"shares must sum to 10000"` — allocations don't total 100%
+    /// * `"share cannot be zero"` — any individual share is 0
+    /// * `"duplicate recipient address"` — same address appears more than once
+    pub fn set_default_recipients(env: Env, recipients: Vec<Recipient>) {
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("contract not initialized");
+
+        admin.require_auth();
+
+        if recipients.is_empty() {
+            panic!("recipients list cannot be empty");
+        }
+
+        if recipients.len() > 10 {
+            panic!("too many recipients: maximum 10 allowed");
+        }
+
+        let mut total_shares: u32 = 0;
+        let mut address_set: Vec<Address> = Vec::new(&env);
+
+        for i in 0..recipients.len() {
+            let recipient = recipients.get(i).unwrap();
+            
+            if recipient.share == 0 {
+                panic!("share cannot be zero");
+            }
+
+            // Check for duplicate addresses
+            for j in 0..address_set.len() {
+                if address_set.get(j).unwrap() == recipient.address {
+                    panic!("duplicate recipient address");
+                }
+            }
+            address_set.push_back(recipient.address.clone());
+
+            total_shares += recipient.share;
+        }
+
+        if total_shares != 10_000 {
+            panic!("shares must sum to 10000");
+        }
+
+        env.storage().instance().set(&DataKey::DefaultRecipients, &recipients);
+
+        env.events().publish(
+            (symbol_short!("default"), symbol_short!("recipients_set")),
+            recipients.len(),
+        );
+    }
+
+    /// Get the default recipient list.
+    ///
+    /// Returns the configured default recipient list, or an empty vec if none has been set.
+    /// Safe to call before initialization or when no defaults are configured.
+    pub fn get_default_recipients(env: Env) -> Vec<Recipient> {
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultRecipients)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Distribute the full contract balance of `token` to recipients with override support.
     ///
     /// # Arguments
     /// * `token` - The token address to distribute (e.g., XLM or other Stellar asset)
+    /// * `override_recipients` - Optional override recipient list. If provided, uses this
+    ///   list instead of default recipients. If None/empty, falls back to default recipients
+    ///   if configured, otherwise uses the original collaborator list.
     ///
     /// # Distribution Logic
-    /// Each collaborator receives: (total_amount * their_share) / 10,000
-    /// The last collaborator receives any remaining dust from integer division rounding.
+    /// Each recipient receives: (total_amount * their_share) / 10,000
+    /// The last recipient receives any remaining dust from integer division rounding.
     ///
     /// # Authorization
     /// Requires admin signature
     ///
     /// # Panics
-    /// * `"recipients list cannot be empty"` — no collaborators are configured
-    pub fn distribute(env: Env, token: Address) {
+    /// * `"recipients list cannot be empty"` — no recipients are configured
+    /// * `"no balance to distribute"` — contract has zero balance of the token
+    /// * `"contract is paused"` — contract is currently paused
+    pub fn distribute_with_override(env: Env, token: Address, override_recipients: Vec<Recipient>) {
         env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
 
         let admin: Address = env
@@ -297,17 +387,53 @@ impl RoyaltySplitter {
             panic!("contract is paused");
         }
 
-        let collaborators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Collaborators)
-            .expect("no collaborators");
+        // Determine which recipient list to use
+        let recipients_to_use: Vec<Recipient> = if !override_recipients.is_empty() {
+            // Use override recipients if provided
+            override_recipients
+        } else {
+            // Try to use default recipients, fall back to collaborators
+            let defaults: Vec<Recipient> = env
+                .storage()
+                .instance()
+                .get(&DataKey::DefaultRecipients)
+                .unwrap_or(Vec::new(&env));
+            
+            if !defaults.is_empty() {
+                defaults
+            } else {
+                // Fall back to original collaborator list
+                let collaborators: Vec<Address> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Collaborators)
+                    .expect("no collaborators");
+                
+                let share_map: Map<Address, u32> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ShareMap)
+                    .expect("no share map");
+                
+                let mut recipients: Vec<Recipient> = Vec::new(&env);
+                for addr in collaborators.iter() {
+                    let share = share_map.get(addr.clone()).unwrap_or(0);
+                    recipients.push_back(Recipient { address: addr, share });
+                }
+                recipients
+            }
+        };
 
-        if collaborators.is_empty() {
+        if recipients_to_use.is_empty() {
             panic!("recipients list cannot be empty");
         }
 
-        if Self::get_total_shares(env.clone()) != 10_000 {
+        // Validate shares sum to 10,000
+        let mut total_shares: u32 = 0;
+        for i in 0..recipients_to_use.len() {
+            total_shares += recipients_to_use.get(i).unwrap().share;
+        }
+        if total_shares != 10_000 {
             panic!("total shares must sum to 10000");
         }
 
@@ -317,29 +443,22 @@ impl RoyaltySplitter {
             panic!("no balance to distribute");
         }
 
-        let share_map: Map<Address, u32> = env
-            .storage()
-            .instance()
-            .get(&DataKey::ShareMap)
-            .expect("no share map");
-
-        let n = collaborators.len();
+        let n = recipients_to_use.len();
         let mut payouts: Vec<(Address, i128)> = Vec::new(&env);
         let mut total_calculated: i128 = 0;
 
-        // Calculate payouts for all collaborators except the last one
+        // Calculate payouts for all recipients except the last one
         for i in 0..(n - 1) {
-            let addr = collaborators.get(i).unwrap();
-            let share = share_map.get(addr.clone()).unwrap_or(0);
-            let payout = (amount as u128 * share as u128 / 10_000) as i128;
-            payouts.push_back((addr, payout));
+            let recipient = recipients_to_use.get(i).unwrap();
+            let payout = (amount as u128 * recipient.share as u128 / 10_000) as i128;
+            payouts.push_back((recipient.address.clone(), payout));
             total_calculated += payout;
         }
 
-        // Last collaborator receives the remainder to avoid dust loss.
+        // Last recipient receives the remainder to avoid dust loss.
         // Dust is bounded by (n - 1) stroops in the worst case.
-        let last = collaborators.get(n - 1).unwrap();
-        payouts.push_back((last, amount - total_calculated));
+        let last = recipients_to_use.get(n - 1).unwrap();
+        payouts.push_back((last.address.clone(), amount - total_calculated));
 
         for (addr, payout) in payouts.iter() {
             token_client.transfer(&env.current_contract_address(), &addr, &payout);
@@ -354,6 +473,55 @@ impl RoyaltySplitter {
         env.storage()
             .instance()
             .set(&DataKey::LastDistribution, &env.ledger().timestamp());
+
+        // Increment distribute history counter with overflow safety
+        let current_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DistributeHistory)
+            .unwrap_or(0);
+        
+        // Use saturating add to prevent overflow - will cap at u64::MAX
+        let new_count = current_count.saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::DistributeHistory, &new_count);
+    }
+
+    /// Get the total number of successful royalty distributions.
+    ///
+    /// Returns a monotonically increasing counter that increments on every
+    /// successful distribute() or distribute_with_override() call. Never decrements. 
+    /// Uses saturating arithmetic to prevent overflow (caps at u64::MAX).
+    ///
+    /// Safe to call at any time — returns 0 if no distributions have occurred.
+    pub fn get_distribute_count(env: Env) -> u64 {
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+        env.storage()
+            .instance()
+            .get(&DataKey::DistributeHistory)
+            .unwrap_or(0)
+    }
+
+    /// Distribute the full contract balance of `token` to all collaborators.
+    ///
+    /// # Arguments
+    /// * `token` - The token address to distribute (e.g., XLM or other Stellar asset)
+    ///
+    /// # Distribution Logic
+    /// Each collaborator receives: (total_amount * their_share) / 10,000
+    /// The last collaborator receives any remaining dust from integer division rounding.
+    ///
+    /// # Authorization
+    /// Requires admin signature
+    ///
+    /// # Panics
+    /// * `"recipients list cannot be empty"` — no collaborators are configured
+    /// * `"no balance to distribute"` — contract has zero balance of the token
+    /// * `"contract is paused"` — contract is currently paused
+    pub fn distribute(env: Env, token: Address) {
+        // Call the enhanced version with empty override for backward compatibility
+        Self::distribute_with_override(env, token, Vec::new(&env));
     }
 
     /// Record a secondary royalty payment transferred from a resale.
