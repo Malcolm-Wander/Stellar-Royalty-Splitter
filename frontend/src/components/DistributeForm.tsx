@@ -119,10 +119,12 @@ export default function DistributeForm({
       )}
       <p className="description">Distributes the specified amount to all collaborators.</p>
       <button
-        className="btn-primary"
+        className="btn-primary btn-with-spinner"
         onClick={submit}
         disabled={loading || exceedsBalance || !amount}
+        aria-busy={loading}
       >
+        {loading && <span className="btn-spinner" aria-hidden="true" />}
         {loading ? "Submitting…" : "Distribute funds"}
       </button>
       {status && <FormStatus type={status.type} message={status.message} />}
