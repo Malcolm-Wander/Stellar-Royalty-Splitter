@@ -119,6 +119,15 @@ describe("POST /api/v1/initialize", () => {
     expect(res.status).toBe(400);
   });
 
+  test("400 when collaborators array is empty", async () => {
+    const res = await request(app)
+      .post("/api/v1/initialize")
+      .send({ ...validBody, collaborators: [], shares: [] });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/collaborators array must be non-empty/i);
+  });
+
   test("400 when required fields are missing", async () => {
     const res = await request(app).post("/api/v1/initialize").send({ contractId: CONTRACT });
 
@@ -154,6 +163,7 @@ describe("POST /api/v1/initialize", () => {
     expect(retryBuildTx).not.toHaveBeenCalled();
     expect(recordTransaction).not.toHaveBeenCalled();
   });
+
 
   test("503 when Stellar RPC is unavailable", async () => {
     isContractInitialized.mockResolvedValue(false);

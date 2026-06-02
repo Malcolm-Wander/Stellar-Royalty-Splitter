@@ -19,18 +19,23 @@ initializeRouter.post(
     try {
       const { contractId, walletAddress, collaborators, shares } = req.body;
 
-      if (!contractId || !walletAddress || !collaborators?.length || !shares?.length) {
-        return res.status(400).json({ error: "Missing required fields." });
-      }
-      if (collaborators.length !== shares.length) {
-        return res
-          .status(400)
-          .json({ error: "Collaborators and shares arrays must be the same length" });
-      }
-      const total = shares.reduce((s, n) => s + n, 0);
-      if (total !== 10_000) {
-        return res.status(400).json({ error: "Shares must sum to 10000 basis points" });
-      }
+    if (!contractId || !walletAddress || !collaborators?.length || !shares?.length) {
+      return res.status(400).json({ error: "Missing required fields." });
+    }
+
+    if (Array.isArray(collaborators) && collaborators.length === 0) {
+      return res.status(400).json({ error: "Collaborators array must be non-empty" });
+    }
+
+    if (collaborators.length !== shares.length) {
+      return res
+        .status(400)
+        .json({ error: "Collaborators and shares arrays must be the same length" });
+    }
+    const total = shares.reduce((s, n) => s + n, 0);
+    if (total !== 10_000) {
+      return res.status(400).json({ error: "Shares must sum to 10000 basis points" });
+    }
 
       // Check if contract is already initialized on-chain
       const alreadyInitialized = await isContractInitialized(contractId);
