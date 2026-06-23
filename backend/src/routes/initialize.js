@@ -2,6 +2,7 @@ import { Router } from "express";
 import { addressToScVal, u32ToScVal, vecToScVal, isContractInitialized } from "../stellar.js";
 import { validate, initializeSchema, validateInitializePayloadSize } from "../validation.js";
 import { buildAndRecordTransaction } from "./_shared.js";
+import { createRequestLogger } from "../logger.js";
 import { sendError } from "../error-response.js";
 
 export const initializeRouter = Router();
@@ -11,6 +12,10 @@ export const initializeRouter = Router();
  * Body: { contractId, walletAddress, collaborators: string[], shares: number[] }
  * Returns: { xdr, transactionId } — unsigned transaction XDR for the frontend to sign & submit + tracking ID
  */
+initializeRouter.post("/", validate(initializeSchema), async (req, res, next) => {
+  const log = createRequestLogger(req);
+  try {
+    const { contractId, walletAddress, collaborators, shares } = req.body;
 initializeRouter.post(
   "/",
   validateInitializePayloadSize,
@@ -37,6 +42,20 @@ initializeRouter.post(
       return res.status(400).json({ error: "Shares must sum to 10000 basis points" });
     }
 
+    log.info("initialize requested", {
+      contractId,
+      walletAddress,
+      collaboratorCount: collaborators.length,
+    });
+
+    // Check if contract is already initialized on-chain
+    const alreadyInitialized = await isContractInitialized(contractId);
+    if (alreadyInitialized) {
+      log.warn("contract already initialized", { contractId });
+      return res.status(409).json({
+        error: "Contract is already initialized. Cannot re-initialize an existing contract.",
+      });
+    }
       // Check if contract is already initialized on-chain
       const alreadyInitialized = await isContractInitialized(contractId);
       if (alreadyInitialized) {
@@ -49,6 +68,33 @@ initializeRouter.post(
       const collaboratorVec = vecToScVal(collaborators.map(addressToScVal));
       const sharesVec = vecToScVal(shares.map(u32ToScVal));
 
+    // Use shared handler to record transaction, build XDR, and log audit
+    const { xdr, transactionId } = await buildAndRecordTransaction({
+      contractId,
+      walletAddress,
+      transactionType: "initialize",
+      scvlArgs: [collaboratorVec, sharesVec],
+      auditAction: "contract_initialized",
+      auditMetadata: {
+        collaboratorCount: collaborators.length,
+        shares,
+      },
+      transactionMetadata: {
+        requestedAmount: null,
+        tokenId: null,
+      },
+      correlationId: req.correlationId,
+    });
+
+    log.info("initialize transaction built", { contractId, transactionId });
+    res.json({ xdr, transactionId });
+  } catch (err) {
+    log.error("initialize failed", {
+      error: err.message ?? String(err),
+      status: err.status,
+    });
+    if (err.status) {
+      return res.status(err.status).json({ error: err.message });
       // Use shared handler to record transaction, build XDR, and log audit
       const { xdr, transactionId } = await buildAndRecordTransaction({
         contractId,
