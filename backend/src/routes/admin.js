@@ -9,7 +9,9 @@ import {
   rotateSigningKey,
 } from "../signing-key.js";
 import { buildAndRecordTransaction } from "./_shared.js";
-import { createApiKey, listApiKeys, revokeApiKey } from "../database/index.js";
+import { getCacheManager } from "../cache.js"; // #399
+import { listDeadLetters, markDeadLetterRetried } from "../database/webhooks.js"; // #428
+import { deliverWithRetry } from "../webhook-delivery.js"; // #428
 
 export const adminRouter = Router();
 
@@ -118,6 +120,78 @@ adminRouter.post("/set-admins", validate(setAdminsSchema), async (req, res, next
 });
 
 /**
+ * POST /admin/transfer
+ * Transfer admin ownership with immediate cache invalidation (#399).
+ * Body: { contractId, walletAddress, newAdmin, signedXdr }
+ */
+adminRouter.post("/transfer", async (req, res, next) => {
+  try {
+    const { contractId, walletAddress, newAdmin, signedXdr } = req.body;
+
+    if (!contractId || !walletAddress || !newAdmin || !signedXdr) {
+      return sendValidationError(res, [
+        { field: "contractId", message: "required" },
+        { field: "walletAddress", message: "required" },
+        { field: "newAdmin", message: "required" },
+        { field: "signedXdr", message: "required" },
+      ]);
+    }
+
+    logger.info("admin_transfer requested", {
+      contractId,
+      walletAddress,
+      newAdmin,
+      correlationId: req.correlationId,
+    });
+
+    const { submitTransaction, getContractAdmin } = await import("../stellar.js");
+
+    // 1. Submit the admin transfer transaction
+    const result = await submitTransaction(signedXdr);
+
+    if (result.status !== "SUCCESS") {
+      logger.warn("admin_transfer transaction failed", {
+        contractId,
+        result,
+        correlationId: req.correlationId,
+      });
+      return sendError(res, 400, "transaction_failed", "Admin transfer transaction failed", {
+        detail: result,
+      });
+    }
+
+    // 2. IMMEDIATE CACHE INVALIDATION (#399 core fix)
+    // This ensures no stale reads even before the event listener catches up
+    const cache = getCacheManager();
+    await cache.invalidateAdmin();
+    logger.info("[Admin] Cache invalidated immediately after transfer", {
+      contractId,
+      newAdmin,
+      transactionHash: result.hash,
+    });
+
+    // 3. Verify the on-chain state matches
+    const liveAdmin = await getContractAdmin(contractId);
+    if (liveAdmin !== newAdmin) {
+      logger.warn("[Admin] On-chain admin mismatch after transfer", {
+        expected: newAdmin,
+        actual: liveAdmin,
+        contractId,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Admin transfer completed and cache invalidated",
+      newAdmin: liveAdmin,
+      transactionHash: result.hash,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * POST /admin/rotate-key
  * Body: { secretKey?: string, reloadFromFile?: boolean }
  * Header: Authorization: Bearer <ADMIN_ROTATE_TOKEN>
@@ -144,67 +218,85 @@ adminRouter.post(
 );
 
 // ---------------------------------------------------------------------------
-// API key management for per-key rate limiting (#420)
+// Webhook dead-letter queue admin endpoints (#428)
 // ---------------------------------------------------------------------------
 
-const generateKeySchema = z.object({
-  label: z.string().max(100, "label must be 100 characters or fewer").optional(),
-});
-
 /**
- * POST /admin/generate-key
- * Issue a new API key. The raw key is returned only in this response —
- * only its hash is persisted, so it can never be retrieved again.
- * Body: { label?: string }
- * Header: Authorization: Bearer <ADMIN_ROTATE_TOKEN>
+ * GET /admin/webhooks/dead-letters/:contractId
+ * List dead-letter queue entries for a contract.
+ * Query params: limit (default 50)
  */
-adminRouter.post(
-  "/generate-key",
-  requireAdminRotateToken,
-  validate(generateKeySchema),
-  (req, res, next) => {
-    try {
-      const { id, apiKey, label, createdAt } = createApiKey(req.body.label);
-      logger.info("API key generated", { event: "api_key_generated", id, label });
-      res.json({ id, apiKey, label, createdAt });
-    } catch (err) {
-      next(err);
-    }
-  },
-);
-
-/**
- * GET /admin/keys
- * List API keys (never includes the raw key or its hash).
- * Header: Authorization: Bearer <ADMIN_ROTATE_TOKEN>
- */
-adminRouter.get("/keys", requireAdminRotateToken, (_req, res, next) => {
+adminRouter.get("/webhooks/dead-letters/:contractId", (req, res, next) => {
   try {
-    res.json({ keys: listApiKeys() });
+    const { contractId } = req.params;
+    const limit = Math.min(parseInt(req.query.limit ?? "50", 10) || 50, 200);
+
+    const entries = listDeadLetters(contractId, limit);
+
+    res.json({
+      success: true,
+      data: entries,
+      count: entries.length,
+    });
   } catch (err) {
     next(err);
   }
 });
 
 /**
- * POST /admin/keys/:id/revoke
- * Revoke an API key by id.
- * Header: Authorization: Bearer <ADMIN_ROTATE_TOKEN>
+ * POST /admin/webhooks/dead-letters/:id/retry
+ * Manually retry a single dead-letter queue entry by its ID (#428).
+ * Resets retryCount so the scheduler will also attempt it again, and
+ * immediately attempts delivery once.
  */
-adminRouter.post("/keys/:id/revoke", requireAdminRotateToken, (req, res, next) => {
+adminRouter.post("/webhooks/dead-letters/:id/retry", async (req, res, next) => {
   try {
-    const id = Number.parseInt(req.params.id, 10);
-    if (!Number.isInteger(id) || id <= 0) {
-      return sendError(res, 400, "bad_request", "id must be a positive integer");
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) {
+      return sendError(res, 400, "invalid_id", "Invalid dead-letter entry ID");
     }
 
-    const revoked = revokeApiKey(id);
-    if (!revoked) {
-      return sendError(res, 404, "not_found", "API key not found or already revoked");
+    // Fetch the entry to retry
+    const { db } = await import("../database/core.js");
+    const entry = db
+      .prepare(
+        `SELECT id, webhookId, contractId, url, payload, errorMessage, retryCount
+         FROM webhook_dead_letters WHERE id = ?`,
+      )
+      .get(id);
+
+    if (!entry) {
+      return sendError(res, 404, "not_found", "Dead-letter entry not found");
     }
 
-    logger.info("API key revoked", { event: "api_key_revoked", id });
-    res.json({ success: true, id });
+    let payload;
+    try {
+      payload = JSON.parse(entry.payload);
+    } catch {
+      return sendError(res, 422, "invalid_payload", "Dead-letter entry has unparseable payload");
+    }
+
+    logger.info("Admin: manually retrying dead-letter entry", {
+      id: entry.id,
+      url: entry.url,
+      contractId: entry.contractId,
+    });
+
+    // Attempt immediate delivery
+    const result = await deliverWithRetry(entry.url, payload).catch((err) => ({
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    }));
+
+    // Update DLQ record based on outcome
+    markDeadLetterRetried(entry.id, result.success);
+
+    res.json({
+      success: result.success,
+      id: entry.id,
+      url: entry.url,
+      ...(result.error && { error: result.error }),
+    });
   } catch (err) {
     next(err);
   }
