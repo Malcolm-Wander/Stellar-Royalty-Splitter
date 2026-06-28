@@ -87,6 +87,7 @@ await jest.unstable_mockModule("../src/database/index.js", () => ({
   initializeDatabase: jest.fn(),
   lookupCollaborators: jest.fn(() => []),
   recordTransaction: jest.fn(() => "tx-456"),
+  recordNonceIfNew: jest.fn(() => true),
 }));
 
 const { default: app } = await import("./app.js");

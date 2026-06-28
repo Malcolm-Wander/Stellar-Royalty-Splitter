@@ -4,7 +4,17 @@
  */
 
 // Core database setup
-export { db, countWrite, initializeDatabase, getMigrationVersion } from "./core.js";
+export {
+  db,
+  checkpointDatabase,
+  closeDatabase,
+  countWrite,
+  initializeDatabase,
+  getMigrationVersion,
+  computeAuditEntryHash,
+  verifyAuditLogIntegrity,
+  verifyAuditLogOnStartup,
+} from "./core.js";
 
 // Transaction tracking
 export {
@@ -15,13 +25,29 @@ export {
   getTransactionCount,
   getTransactionHistory,
   getTransactionDetails,
+  getTransactionById,
 } from "./transactions.js";
+
+// Webhooks (#295, #401, #428)
+export {
+  registerWebhook,
+  listWebhooks,
+  deleteWebhook,
+  enqueueDeadLetter,
+  listDeadLetters,
+  listAllPendingDeadLetters,
+  markDeadLetterRetried,
+  deleteOldDeadLetters,
+} from "./webhooks.js";
 
 // Audit logging
 export { getAuditLog, addAuditLog } from "./audit.js";
 
 // Collaborator lookup
 export { lookupCollaborators } from "./collaborator-lookup.js";
+
+// Request nonce dedup (#421)
+export { recordNonceIfNew } from "./request-nonces.js";
 
 // Secondary royalties
 export {
@@ -32,6 +58,8 @@ export {
   recordSecondaryRoyaltyDistribution,
   getSecondaryRoyaltyDistributions,
   getRoyaltyStatistics,
+  applyLargestRemainder,
+  commitSecondaryDistributionAtomic,
 } from "./secondary-royalties.js";
 
 // Analytics

@@ -1,9 +1,11 @@
 import { Router } from "express";
 import StellarSdk from "@stellar/stellar-sdk";
-import { server, networkPassphrase } from "../stellar.js";
+import { server, networkPassphrase, getNetworkLabel } from "../stellar.js";
 import logger from "../logger.js";
 import { validateContractIdMiddleware } from "../validation.js";
 import { lookupCollaborators } from "../database/index.js";
+import { sendError } from "../error-response.js";
+import { recordCacheHit, recordCacheMiss } from "../metrics.js";
 
 const {
   Address,
@@ -15,6 +17,27 @@ const {
 } = StellarSdk;
 
 export const collaboratorsRouter = Router();
+
+// Issue #422: collaborator shares are effectively immutable once a contract
+// is initialized, so we cache them for 5 minutes — far longer than the 30s
+// contract-state cache — and invalidate immediately on (re-)initialize
+// rather than relying solely on the TTL.
+const COLLABORATORS_CACHE_TTL_MS = 5 * 60 * 1000;
+const collaboratorsCache = new Map();
+
+/** Cache key format: `contract:{network}:{contractId}:collaborators` (#422). */
+function getCollaboratorsCacheKey(contractId) {
+  return `contract:${getNetworkLabel()}:${contractId}:collaborators`;
+}
+
+export function _resetCollaboratorsCache() {
+  collaboratorsCache.clear();
+}
+
+/** Invalidate the cached collaborator list for a contract (#422). */
+export function invalidateCollaboratorsCache(contractId) {
+  collaboratorsCache.delete(getCollaboratorsCacheKey(contractId));
+}
 
 /**
  * GET /api/collaborators/lookup?q=G...&limit=10
@@ -35,6 +58,16 @@ collaboratorsRouter.get("/lookup", (req, res) => {
 collaboratorsRouter.get("/:contractId", validateContractIdMiddleware, async (req, res, next) => {
   try {
     const { contractId } = req.params;
+    const cacheKey = getCollaboratorsCacheKey(contractId);
+    const cached = collaboratorsCache.get(cacheKey);
+    const now = Date.now();
+
+    if (cached && now - cached.fetchedAt < COLLABORATORS_CACHE_TTL_MS) {
+      recordCacheHit("collaborators");
+      return res.json(cached.data);
+    }
+
+    recordCacheMiss("collaborators");
     const contract = new Contract(contractId);
 
     const dummyAccount = new Account(
@@ -53,7 +86,7 @@ collaboratorsRouter.get("/:contractId", validateContractIdMiddleware, async (req
 
     const sim = await server.simulateTransaction(tx);
     if (SorobanRpc.Api.isSimulationError(sim)) {
-      return res.status(400).json({ error: sim.error });
+      return sendError(res, 400, "contract_simulation_failed", sim.error ?? "Simulation failed");
     }
 
     const resultVal = sim.result?.retval;
@@ -67,6 +100,7 @@ collaboratorsRouter.get("/:contractId", validateContractIdMiddleware, async (req
     }));
 
     logger.info(`get_all_shares returned ${results.length} collaborators for ${contractId}`);
+    collaboratorsCache.set(cacheKey, { data: results, fetchedAt: now });
     res.json(results);
   } catch (err) {
     next(err);
