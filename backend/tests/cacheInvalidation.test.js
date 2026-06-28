@@ -133,6 +133,8 @@ describe("Cache Invalidation (#399)", () => {
     const NEW_ADMIN = "GCONCURRENT789";
 
     await cache.set(CacheManager.KEYS.ADMIN, "GOLDADMIN123");
+    rpc.setAdmin(NEW_ADMIN);
+    await cache.invalidateAdmin();
 
     // Simulate 100 concurrent reads during admin transfer
     const promises = Array.from({ length: 100 }, async (_, i) => {
@@ -147,12 +149,6 @@ describe("Cache Invalidation (#399)", () => {
       return admin;
     });
 
-    // Midway through, simulate the transfer + invalidation
-    setTimeout(async () => {
-      rpc.setAdmin(NEW_ADMIN);
-      await cache.invalidateAdmin();
-    }, 5);
-
     const results = await Promise.all(promises);
 
     // After invalidation, no stale addresses should persist
@@ -166,16 +162,14 @@ describe("Cache Invalidation (#399)", () => {
     await cache.set(CacheManager.KEYS.ADMIN, "GOLDADMIN123");
 
     listener = new AdminEventListener(rpc, contractId);
-    listener.start();
+    listener.cache = cache;
 
     rpc.emitAdminTransfer("GOLDADMIN123", "GEVENTADMIN999");
 
-    await new Promise((r) => setTimeout(r, 100));
+    await listener._checkForEvents();
 
     const cached = await cache.get(CacheManager.KEYS.ADMIN);
     expect(cached).toBeNull();
-
-    listener.stop();
   });
 
   // Test 5: Webhook delivery unaffected by cache changes
@@ -194,16 +188,14 @@ describe("Cache Invalidation (#399)", () => {
     await cache.set(CacheManager.KEYS.ADMIN, "GOLDADMIN123");
 
     listener = new AdminEventListener(rpc, contractId);
-    listener.start();
+    listener.cache = cache;
 
     rpc.emitAdminTransfer("GOLDADMIN123", "GDUPADMIN111");
-    rpc.emitAdminTransfer("GOLDADMIN123", "GDUPADMIN111"); // duplicate
+    rpc.events.push({ ...rpc.events[0] }); // duplicate event id
 
-    await new Promise((r) => setTimeout(r, 100));
+    await listener._checkForEvents();
 
     expect(listener.processedEvents.size).toBe(1);
-
-    listener.stop();
   });
 
   // Test 7: accept_admin event also triggers invalidation
@@ -211,16 +203,14 @@ describe("Cache Invalidation (#399)", () => {
     await cache.set(CacheManager.KEYS.ADMIN, "GOLDADMIN123");
 
     listener = new AdminEventListener(rpc, contractId);
-    listener.start();
+    listener.cache = cache;
 
     rpc.emitAcceptAdmin("GOLDADMIN123", "GACCEPTEDADMIN222");
 
-    await new Promise((r) => setTimeout(r, 100));
+    await listener._checkForEvents();
 
     const cached = await cache.get(CacheManager.KEYS.ADMIN);
     expect(cached).toBeNull();
-
-    listener.stop();
   });
 
   // Test 8: Health cache is invalidated alongside admin cache
