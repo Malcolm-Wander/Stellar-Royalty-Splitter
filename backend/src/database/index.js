@@ -34,6 +34,9 @@ export {
 // Analytics
 export { getAnalyticsData } from "./analytics.js";
 
+// Query profiling (#500)
+export { getQueryProfilerMetrics, resetQueryProfilerMetrics } from "../query-profiler.js";
+
 // Default export for backwards compatibility
 import { db } from "./core.js";
 export default db;

@@ -18,6 +18,32 @@ await jest.unstable_mockModule("../src/stellar.js", () => ({
 await jest.unstable_mockModule("../src/database/index.js", () => ({
   initializeDatabase: jest.fn(),
   getMigrationVersion: jest.fn(() => 2),
+  getQueryProfilerMetrics: jest.fn(() => ({
+    enabled: true,
+    thresholdMs: 100,
+    totalQueries: 3,
+    slowQueries: 1,
+    averageDurationMs: 42,
+    maxDurationMs: 128,
+    operations: {
+      all: {
+        count: 1,
+        slowCount: 1,
+        averageDurationMs: 128,
+        maxDurationMs: 128,
+      },
+    },
+    slowQuerySamples: [
+      {
+        sql: "SELECT * FROM transactions",
+        operation: "all",
+        durationMs: 128,
+        thresholdMs: 100,
+        observedAt: "2026-01-01T00:00:00.000Z",
+        recommendations: ["Run EXPLAIN QUERY PLAN for this statement."],
+      },
+    ],
+  })),
 }));
 
 const { clearHealthCache } = await import("../src/routes/health.js");
@@ -57,6 +83,12 @@ describe("GET /api/v1/health", () => {
       ok: true,
       dbVersion: 2,
       network: "Testnet",
+      queryProfiler: {
+        enabled: true,
+        thresholdMs: 100,
+        totalQueries: 3,
+        slowQueries: 1,
+      },
       horizon: { connected: true, url: expect.any(String) },
       contract: {
         configured: true,
@@ -100,5 +132,28 @@ describe("GET /api/v1/health", () => {
 
     expect(checkHorizonConnectivity).toHaveBeenCalledTimes(1);
     expect(checkContractDeploymentStatus).toHaveBeenCalledTimes(1);
+  });
+
+  test("returns query performance metrics", async () => {
+    const res = await request(app).get("/api/v1/health/query-performance");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      enabled: true,
+      thresholdMs: 100,
+      totalQueries: 3,
+      slowQueries: 1,
+      operations: {
+        all: {
+          count: 1,
+          slowCount: 1,
+        },
+      },
+    });
+    expect(res.body.slowQuerySamples[0]).toMatchObject({
+      sql: "SELECT * FROM transactions",
+      operation: "all",
+      durationMs: 128,
+    });
   });
 });

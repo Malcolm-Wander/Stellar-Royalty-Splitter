@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { getMigrationVersion } from "../database/index.js";
+import { getMigrationVersion, getQueryProfilerMetrics } from "../database/index.js";
 import {
   getConfiguredContractId,
   getNetworkLabel,
@@ -39,6 +39,7 @@ healthRouter.get("/", async (_req, res, next) => {
       network: getNetworkLabel(),
       horizon,
       contract,
+      queryProfiler: getQueryProfilerMetrics(),
     };
 
     cachedHealth = body;
@@ -47,6 +48,14 @@ healthRouter.get("/", async (_req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+/**
+ * GET /api/v1/health/query-performance
+ * Exposes in-process query profiling metrics for operators and dashboards.
+ */
+healthRouter.get("/query-performance", (_req, res) => {
+  res.json(getQueryProfilerMetrics());
 });
 
 /** Reset cached health (for tests). */
