@@ -41,7 +41,7 @@ export {
 } from "./webhooks.js";
 
 // Audit logging
-export { getAuditLog, addAuditLog } from "./audit.js";
+export { getAuditLog, addAuditLog, exportAuditLogs } from "./audit.js";
 
 // Request nonce dedup (#421)
 export { recordNonceIfNew } from "./request-nonces.js";
