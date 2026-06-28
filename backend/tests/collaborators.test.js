@@ -67,7 +67,7 @@ await jest.unstable_mockModule("../src/database/index.js", () => ({
 
 const { default: app } = await import("./app.js");
 const { SorobanRpc } = await import("@stellar/stellar-sdk");
-const { _resetCollaboratorsCache } = await import("../src/routes/collaborators.js");
+const { _resetCollaboratorsCache } = await import("../src/collaborators-cache.js");
 
 describe("GET /api/v1/collaborators/:contractId", () => {
   beforeEach(() => {
