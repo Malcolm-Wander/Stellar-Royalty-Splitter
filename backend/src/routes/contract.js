@@ -11,6 +11,7 @@ import {
 } from "../stellar.js";
 import { validateContractIdMiddleware, validateContractId } from "../validation.js";
 import { sendError } from "../error-response.js";
+import { recordCacheHit, recordCacheMiss } from "../metrics.js";
 
 const { Contract, SorobanRpc, TransactionBuilder, BASE_FEE, Account } = StellarSdk;
 
@@ -30,6 +31,20 @@ function getConfiguredTokenId() {
 
 function firstQueryValue(value) {
   return Array.isArray(value) ? value[0] : value;
+}
+
+function shouldBypassCache(value) {
+  const normalized = String(firstQueryValue(value) ?? "").toLowerCase();
+  return normalized === "false" || normalized === "0" || normalized === "no";
+}
+
+function withCacheMetadata(state, cacheStatus, fetchedAt) {
+  return {
+    ...state,
+    cacheStatus,
+    cacheTtlMs: CONTRACT_STATE_CACHE_TTL_MS,
+    fetchedAt: new Date(fetchedAt).toISOString(),
+  };
 }
 
 function i128ScValToString(scVal) {
@@ -90,8 +105,15 @@ async function readContractState(contractId, tokenId) {
   };
 }
 
+/**
+ * Cache key format: `contract:{network}:{contractId}:state:{tokenId}` (#422).
+ * The network segment is required (not just cosmetic): the same `contractId`
+ * string can be queried against both testnet and mainnet, and without a
+ * network discriminator those two distinct on-chain states would alias to
+ * the same cache entry.
+ */
 function getContractStateCacheKey(contractId, tokenId) {
-  return `${getNetworkLabel()}:${networkPassphrase}:${contractId}:${tokenId}`;
+  return `contract:${getNetworkLabel()}:${contractId}:state:${tokenId}`;
 }
 
 function resolveStateRequest(req, res) {
@@ -99,18 +121,14 @@ function resolveStateRequest(req, res) {
   const tokenId = firstQueryValue(req.query.tokenId) ?? getConfiguredTokenId();
 
   if (!contractId) {
-    res.status(400).json({
-      error: "contractId query param required when no default contract is configured",
-    });
+    sendError(res, 400, "bad_request", "contractId query param required when no default contract is configured");
     return null;
   }
 
   if (!validateContractId(contractId, res)) return null;
 
   if (!tokenId) {
-    res.status(400).json({
-      error: "tokenId query param required when no default token is configured",
-    });
+    sendError(res, 400, "bad_request", "tokenId query param required when no default token is configured");
     return null;
   }
 
@@ -123,6 +141,20 @@ export function _resetContractStateCache() {
   contractStateCache.clear();
 }
 
+/**
+ * Invalidate cached state for a contract across all cached token ids (#422).
+ * The 30s TTL already self-heals quickly, but this lets callers (e.g. a
+ * successful initialize) clear stale data immediately instead of waiting
+ * out the TTL.
+ */
+export function invalidateContractStateCache(contractId) {
+  for (const key of contractStateCache.keys()) {
+    if (key.includes(`:${contractId}:`)) {
+      contractStateCache.delete(key);
+    }
+  }
+}
+
 contractRouter.get("/state", async (req, res, next) => {
   try {
     const stateRequest = resolveStateRequest(req, res);
@@ -132,17 +164,19 @@ contractRouter.get("/state", async (req, res, next) => {
     const cacheKey = getContractStateCacheKey(contractId, tokenId);
     const cached = contractStateCache.get(cacheKey);
     const now = Date.now();
+    const bypassCache = shouldBypassCache(req.query.cache);
 
-    if (cached && now - cached.fetchedAt < CONTRACT_STATE_CACHE_TTL_MS) {
-      return res.json(cached.state);
+    if (!bypassCache && cached && now - cached.fetchedAt < CONTRACT_STATE_CACHE_TTL_MS) {
+      return res.json(withCacheMetadata(cached.state, "cached", cached.fetchedAt));
     }
 
+    recordCacheMiss("contract_state");
     const state = await readContractState(contractId, tokenId);
     contractStateCache.set(cacheKey, { state, fetchedAt: now });
-    res.json(state);
+    res.json(withCacheMetadata(state, "live", now));
   } catch (err) {
     if (err.status) {
-      return res.status(err.status).json({ error: err.message });
+      return sendError(res, err.status, undefined, err.message);
     }
     next(err);
   }
@@ -172,6 +206,45 @@ contractRouter.get("/status/:contractId", validateContractIdMiddleware, async (r
     const initialized = await isContractInitialized(contractId);
     res.json({ initialized });
   } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/contract/pause/:contractId
+ * #504: Returns the contract's pause state so the UI can warn users (and disable
+ * distribution) before they sign a transaction that would panic on-chain.
+ *
+ * Response: {
+ *   paused: boolean,
+ *   pauseTimestamp: number,   // unix seconds the pause began (0 if not paused)
+ *   pauseSource: string|null, // address that initiated the pause
+ *   remainingSeconds: number  // seconds until an emergency pause auto-expires
+ * }
+ */
+contractRouter.get("/pause/:contractId", validateContractIdMiddleware, async (req, res, next) => {
+  try {
+    const { contractId } = req.params;
+    const [pausedVal, infoVal] = await Promise.all([
+      simulateContractRead(contractId, "is_paused"),
+      simulateContractRead(contractId, "get_pause_info"),
+    ]);
+
+    const paused = pausedVal ? Boolean(StellarSdk.scValToNative(pausedVal)) : false;
+    const [timestamp = 0n, source = null, remaining = 0n] = infoVal
+      ? StellarSdk.scValToNative(infoVal)
+      : [];
+
+    res.json({
+      paused,
+      pauseTimestamp: Number(timestamp),
+      pauseSource: source ? String(source) : null,
+      remainingSeconds: Number(remaining),
+    });
+  } catch (err) {
+    if (err.status) {
+      return sendError(res, err.status, undefined, err.message);
+    }
     next(err);
   }
 });

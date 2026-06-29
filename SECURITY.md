@@ -104,10 +104,10 @@ The following components are in scope for security research:
 
 - Never commit secrets, private keys, or `.env` files — `.gitignore` covers these, but verify
   before every push.
-- **Use encrypted secrets stores in production** — AWS Secrets Manager or HashiCorp Vault are
-  supported. Plaintext `SIGNING_KEY_FILE` or `SERVER_SECRET_KEY` should only be used for local
-  development.
-- Configure `SECRETS_ENCRYPTION_KEY` for at-rest encryption of cached secrets.
+- Use `SIGNING_KEY_FILE` (secrets-manager integration) rather than `SERVER_SECRET_KEY` in
+  production environments.
+- Require signed write requests with a nonce and timestamp so backend mutations can reject
+  tampered, stale, or replayed payloads.
 - Rotate `ADMIN_ROTATE_TOKEN` after any suspected compromise.
 - Keep the Stellar CLI and all dependencies up to date.
 - Review the `SECURITY_AUDIT.md` in this repository for known findings and their mitigations.
