@@ -20,6 +20,7 @@ import { adminRouter } from "./routes/admin.js";
 import { initializeDatabase } from "./database/index.js";
 import db from "./database/index.js";
 import { initializeSigningKey } from "./signing-key.js";
+import { verifySignedWriteRequest } from "./request-signature.js";
 
 // Initialize database on startup
 initializeDatabase();
@@ -108,6 +109,15 @@ app.use((req, res, next) => {
 app.use("/api/v1/initialize", writeLimiter);
 app.use("/api/v1/distribute", writeLimiter);
 app.use("/api/v1/secondary-royalty", writeLimiter);
+app.use("/api/v1/transaction", writeLimiter);
+app.use("/api/v1/audit", writeLimiter);
+
+// Require Ed25519 request signatures for mutating client API operations.
+app.use("/api/v1/initialize", verifySignedWriteRequest);
+app.use("/api/v1/distribute", verifySignedWriteRequest);
+app.use("/api/v1/secondary-royalty", verifySignedWriteRequest);
+app.use("/api/v1/transaction", verifySignedWriteRequest);
+app.use("/api/v1/audit", verifySignedWriteRequest);
 
 app.use("/api/v1/initialize", initializeRouter);
 app.use("/api/v1/distribute", distributeRouter);

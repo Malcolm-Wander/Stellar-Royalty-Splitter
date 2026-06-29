@@ -1,8 +1,10 @@
 // Thin client that talks to the Express backend
 
 import { extractContractError } from "./lib/contract-errors";
+import { createSignedRequestHeaders } from "./request-signing";
+export { setRequestSigningSecret } from "./request-signing";
 
-const BASE = "/api";
+const BASE = "/api/v1";
 
 // #279: surface a structured `code + message + details` shape from
 // the backend's error response instead of just `data.error`. The
@@ -34,9 +36,17 @@ function readErrorBody(status: number, data: unknown): BackendApiError {
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const requestPath = `${BASE}${path}`;
+  const res = await fetch(requestPath, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...createSignedRequestHeaders({
+        method: "POST",
+        path: requestPath,
+        body,
+      }),
+    },
     body: JSON.stringify(body),
   });
   const data = await res.json();

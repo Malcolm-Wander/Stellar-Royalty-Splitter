@@ -106,6 +106,8 @@ The following components are in scope for security research:
   before every push.
 - Use `SIGNING_KEY_FILE` (secrets-manager integration) rather than `SERVER_SECRET_KEY` in
   production environments.
+- Require signed write requests with a nonce and timestamp so backend mutations can reject
+  tampered, stale, or replayed payloads.
 - Rotate `ADMIN_ROTATE_TOKEN` after any suspected compromise.
 - Keep the Stellar CLI and all dependencies up to date.
 - Review the `SECURITY_AUDIT.md` in this repository for known findings and their mitigations.
